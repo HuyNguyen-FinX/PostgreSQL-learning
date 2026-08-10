@@ -1,0 +1,33 @@
+name: pg-lab
+
+services:
+  db:
+    image: postgres:17-bookworm
+    container_name: pg-lab
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: lab
+      TZ: Asia/Ho_Chi_Minh
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+    ports:
+      # Cổng phía host là 5433 để không đụng PostgreSQL cài sẵn trên máy (nếu có).
+      - "5433:5432"
+    volumes:
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ../sql:/sql:ro
+      - pgdata:/var/lib/postgresql/data
+    # Parallel query dùng shared memory; mặc định 64MB của Docker là quá ít.
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d lab"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:
