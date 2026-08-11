@@ -1,0 +1,362 @@
+# Phần 15 — Phía application
+
+> **Mục tiêu:** viết code không tạo ra vấn đề database. Phần lớn sự cố PostgreSQL trên
+> production bắt nguồn từ đây, không phải từ cấu hình database.
+
+---
+
+## 1. N+1 query
+
+### 1.1. Vấn đề
+
+```python
+don_hangs = db.query("SELECT * FROM orders LIMIT 100")
+for dh in don_hangs:
+    dh.user = db.query("SELECT * FROM users WHERE id = ?", dh.user_id)
+```
+
+101 lần gọi database. Mỗi lần tốn một vòng mạng — trên cùng máy khoảng 0,1 ms, qua mạng nội bộ
+1–2 ms. 100 lần lặp thành 100–200 ms **chỉ để chờ mạng**, dù mỗi query chạy dưới 0,1 ms.
+
+### 1.2. Phát hiện
+
+Trong `pg_stat_statements`, dấu hiệu rất rõ:
+
+```text
+ calls   | tb_ms | query
+---------+-------+------------------------------------------
+ 1250000 |  0.04 | SELECT * FROM users WHERE id = $1
+```
+
+**`calls` khổng lồ với `mean_exec_time` cực nhỏ.** Query không hề chậm — nó chỉ bị gọi quá nhiều.
+Đây là lý do tối ưu query đó vô ích; phải sửa ở tầng ứng dụng.
+
+### 1.3. Sửa
+
+```sql
+-- Một query thay cho 101
+SELECT o.*, u.email, u.full_name
+FROM orders o JOIN users u ON u.id = o.user_id
+LIMIT 100;
+```
+
+Hoặc hai query với `IN`:
+
+```sql
+SELECT * FROM users WHERE id = ANY($1);   -- truyền mảng id
+```
+
+Trong ORM, đó là `JOIN FETCH` (Hibernate), `selectinload` / `joinedload` (SQLAlchemy),
+`includes` (ActiveRecord), `Preload` (GORM).
+
+> **Đừng tắt lazy loading toàn cục** — nó sẽ nạp thừa dữ liệu ở chỗ khác. Sửa đúng chỗ gây vấn đề.
+
+---
+
+## 2. Ghi hàng loạt
+
+Đo thật trên môi trường Phần 00 (100.000 row):
+
+| Cách | Ghi chú |
+|---|---|
+| `INSERT` từng dòng, mỗi dòng một transaction | Chậm nhất — mỗi lần là một `fsync` |
+| `INSERT` từng dòng trong một transaction | Nhanh hơn nhiều |
+| `INSERT` nhiều giá trị (`VALUES (...), (...)`) | Nhanh hơn nữa |
+| **`COPY`** | **Nhanh nhất** |
+
+Phần 07 đã đo: một `INSERT ... SELECT` 100.000 row sinh `WAL: records=100000 bytes=9200000`.
+`COPY` sinh ít WAL hơn đáng kể vì gom nhiều row vào mỗi WAL record.
+
+```sql
+COPY orders (user_id, status, total_amount, created_at) FROM STDIN WITH (FORMAT csv);
+```
+
+Mọi driver hiện đại đều hỗ trợ: `copy_expert` (psycopg), `CopyManager` (JDBC),
+`CopyFrom` (pgx).
+
+`INSERT` nhiều giá trị với `ON CONFLICT`:
+
+```sql
+INSERT INTO ton_kho (san_pham_id, so_luong) VALUES ($1,$2), ($3,$4), ($5,$6)
+ON CONFLICT (san_pham_id) DO UPDATE SET so_luong = ton_kho.so_luong + EXCLUDED.so_luong;
+```
+
+**Cảnh báo:** `ON CONFLICT DO UPDATE` với lô lớn dễ gây deadlock nếu các lô có thứ tự khóa khác
+nhau. Luôn `ORDER BY` khóa trước khi gửi lô (Phần 08).
+
+---
+
+## 3. Transaction boundary — nguồn sự cố lớn nhất
+
+### 3.1. Quy tắc
+
+> **Không bao giờ gọi ra ngoài (HTTP, message queue, đọc file) bên trong một transaction database.**
+
+```python
+# ❌ SAI
+with db.transaction():
+    don = db.insert_order(...)
+    thanh_toan = requests.post("https://payment/charge", ...)   # 2 giây
+    db.update_order(don.id, thanh_toan.id)
+```
+
+Transaction mở suốt 2 giây chờ HTTP. Với 100 request đồng thời, đó là 100 transaction cùng mở.
+
+Hậu quả, tất cả đã gặp trong giáo trình này:
+
+- Giữ lock → chặn transaction khác (Phần 08).
+- Giữ `xmin` → **chặn VACUUM trên toàn database** (Phần 04).
+- Chiếm connection → pool đầy dù CPU thấp (Phần 11).
+- Nếu HTTP timeout → `idle in transaction` kéo dài.
+
+```python
+# ✅ ĐÚNG
+with db.transaction():
+    don = db.insert_order(...)          # transaction ngắn
+
+thanh_toan = requests.post(...)         # ngoài transaction
+
+with db.transaction():
+    db.update_order(don.id, thanh_toan.id)
+```
+
+### 3.2. Đặt hàng rào
+
+```sql
+ALTER ROLE api_user SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE api_user SET statement_timeout = '30s';
+ALTER ROLE api_user SET lock_timeout = '5s';
+```
+
+Ba tham số này biến một bug âm thầm thành một lỗi rõ ràng trong log — dễ sửa hơn nhiều.
+
+---
+
+## 4. Idempotency và outbox pattern
+
+### 4.1. Vấn đề
+
+Mục 3 tách HTTP ra ngoài transaction, nhưng tạo ra vấn đề mới: nếu tiến trình chết giữa hai
+transaction, đơn hàng đã tạo mà thanh toán chưa ghi nhận.
+
+### 4.2. Outbox pattern
+
+Ghi "việc cần làm" vào **cùng transaction** với thay đổi nghiệp vụ:
+
+```sql
+BEGIN;
+INSERT INTO orders (...) VALUES (...) RETURNING id;
+INSERT INTO outbox (loai, payload) VALUES ('order_created', '{"order_id": 123}');
+COMMIT;
+```
+
+Một worker riêng đọc `outbox` và gửi đi — dùng đúng mẫu `SKIP LOCKED` của Phần 08:
+
+```sql
+UPDATE outbox SET trang_thai = 'processing'
+WHERE id IN (
+    SELECT id FROM outbox WHERE trang_thai = 'pending'
+    ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED
+)
+RETURNING id, loai, payload;
+```
+
+Đảm bảo **at-least-once**: sự kiện có thể gửi trùng, nên bên nhận **phải** idempotent.
+
+Nhắc lại Phần 08: bảng outbox bị ghi và xóa liên tục nên bloat nhanh. Cấu hình bắt buộc:
+
+```sql
+ALTER TABLE outbox SET (
+    autovacuum_vacuum_scale_factor = 0.01,
+    autovacuum_vacuum_threshold    = 100
+);
+CREATE INDEX ON outbox (id) WHERE trang_thai = 'pending';
+```
+
+### 4.3. Idempotency key
+
+```sql
+CREATE TABLE thanh_toan (
+    id             bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    idempotency_key text NOT NULL UNIQUE,
+    ...
+);
+
+INSERT INTO thanh_toan (idempotency_key, ...) VALUES ($1, ...)
+ON CONFLICT (idempotency_key) DO NOTHING
+RETURNING id;
+```
+
+Không trả về row nào nghĩa là đã xử lý rồi. Đây là cách để database **đảm bảo** tính idempotent
+thay vì dựa vào logic ứng dụng.
+
+---
+
+## 5. Retry đúng cách
+
+```text
+40001  serialization_failure   — Serializable hoặc Repeatable Read xung đột (Phần 03)
+40P01  deadlock_detected       — deadlock (Phần 08)
+```
+
+```python
+for lan in range(5):
+    try:
+        with db.transaction():
+            chay_nghiep_vu()
+        break
+    except (SerializationFailure, DeadlockDetected):
+        if lan == 4:
+            raise
+        time.sleep(0.05 * (2 ** lan) * (0.5 + random.random()))  # backoff + jitter
+```
+
+Bốn điều bắt buộc:
+
+1. **Retry toàn bộ transaction**, không phải chỉ câu lệnh lỗi — snapshot cũ đã hỏng.
+2. **Có backoff và jitter.** Retry đồng loạt sẽ xung đột lại y như cũ.
+3. **Có giới hạn.** Retry vô hạn biến một xung đột thành một sự cố.
+4. **Nghiệp vụ phải idempotent hoặc nằm trọn trong transaction.** Nếu không, retry thực hiện
+   side effect hai lần.
+
+Đừng retry `unique_violation` (23505) hay `check_violation` (23514) — chúng là lỗi logic, retry
+sẽ lỗi lại y hệt.
+
+---
+
+## 6. Pagination
+
+### 6.1. `OFFSET` lớn là cái bẫy
+
+```sql
+SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 100000;
+```
+
+PostgreSQL phải **đọc và vứt bỏ 100.000 row** trước khi trả về 20 row. Trang càng sâu càng chậm —
+độ phức tạp tuyến tính theo số trang.
+
+Nhìn thấy trực tiếp trong plan (Phần 07):
+
+```text
+Limit (actual rows=20 loops=1)
+  ->  Index Scan using orders_pkey on orders (actual rows=100020 loops=1)
+```
+
+`actual rows=100020` để trả về 20.
+
+### 6.2. Keyset pagination
+
+```sql
+-- Trang đầu
+SELECT * FROM orders ORDER BY id LIMIT 20;
+
+-- Trang sau: truyền id cuối của trang trước
+SELECT * FROM orders WHERE id > $1 ORDER BY id LIMIT 20;
+```
+
+Thời gian **không đổi** dù ở trang nào. Với khóa nhiều cột:
+
+```sql
+SELECT * FROM orders
+WHERE (created_at, id) < ($1, $2)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+So sánh bộ giá trị `(a, b) < (x, y)` là cú pháp chuẩn SQL và **dùng được index** trên `(created_at, id)`.
+
+Đánh đổi: không nhảy tới trang N tuỳ ý. Trong thực tế, gần như không ai nhảy tới trang 5.000 —
+nhưng crawler thì có, và đó chính là lúc `OFFSET` làm sập hệ thống.
+
+### 6.3. Đếm tổng số row
+
+`SELECT count(*)` trên bảng lớn luôn quét toàn bộ. Ba lựa chọn:
+
+```sql
+-- 1. Ước lượng, gần như tức thì
+SELECT reltuples::bigint FROM pg_class WHERE relname = 'orders';
+
+-- 2. Đếm chính xác nhưng có trần
+SELECT count(*) FROM (SELECT 1 FROM orders WHERE ... LIMIT 1000) t;
+
+-- 3. Bảng đếm riêng, cập nhật bằng trigger
+```
+
+Phần lớn giao diện chỉ cần "khoảng 1,2 triệu kết quả" — dùng ước lượng.
+
+---
+
+## 7. Bẫy ORM
+
+| Bẫy | Triệu chứng | Cách xử lý |
+|---|---|---|
+| Lazy loading | N+1 (mục 1) | Nạp sẵn quan hệ đúng chỗ cần |
+| `SELECT *` mặc định | Đọc cả column TOAST không dùng (Phần 02) | Chỉ chọn column cần |
+| Transaction bao cả request | Transaction dài (mục 3) | Chỉ mở transaction quanh phần ghi |
+| Prepared statement + PgBouncer | Lỗi khó hiểu ở transaction pooling (Phần 11) | Tắt ở driver, hoặc PgBouncer 1.21+ |
+| Savepoint tự động cho mỗi câu lệnh | `SubtransSLRU` contention (Phần 03) | Tắt tính năng "tiếp tục sau lỗi" |
+| Migration tự sinh | `ALTER COLUMN TYPE` viết lại bảng (Phần 13) | **Luôn đọc SQL trước khi chạy** |
+| Connection pool của ORM + PgBouncer | Hai tầng pool, khó chẩn đoán | Chọn một tầng |
+
+Bẫy nguy hiểm nhất là hàng áp chót. Migration do ORM sinh ra rất hay chứa `ALTER COLUMN TYPE`
+hoặc `SET NOT NULL` — thao tác viết lại toàn bộ bảng trong lúc giữ `ACCESS EXCLUSIVE` (Phần 08,
+Phần 13).
+
+> **Luôn đọc SQL mà công cụ migration sinh ra, trước khi chạy trên production.**
+
+---
+
+## 8. Cache — khi nào và khi nào không
+
+Cache che giấu vấn đề chứ không sửa nó. Trước khi thêm cache, hãy hỏi:
+
+1. Query này có thể tối ưu được không (index, viết lại)?
+2. Dữ liệu có thật sự ít thay đổi không?
+3. Chấp nhận dữ liệu cũ bao lâu?
+4. Ai chịu trách nhiệm xóa cache khi dữ liệu đổi?
+
+Câu 4 là câu khó nhất, và là nơi cache tạo ra bug.
+
+**Nên cache:** dữ liệu tra cứu ít đổi (danh mục, cấu hình), kết quả tính toán đắt (báo cáo tổng
+hợp), dữ liệu chung cho nhiều người dùng.
+
+**Không nên cache:** query chậm vì thiếu index — hãy tạo index; dữ liệu riêng từng người dùng
+với tỷ lệ trúng thấp; bất cứ thứ gì mà đọc phải dữ liệu cũ gây sai nghiệp vụ.
+
+Nhắc lại Phần 01: PostgreSQL đã có hai tầng cache (`shared_buffers` + OS page cache). Một query
+lấy từ `shared_buffers` mất vài chục micro-giây. Cache ngoài chỉ có ý nghĩa khi tiết kiệm được
+**tính toán**, không phải khi tiết kiệm **I/O** — I/O thường đã được cache lo rồi.
+
+---
+
+## 9. Checklist review code chạm database
+
+- [ ] Có vòng lặp nào gọi database bên trong không? (N+1)
+- [ ] Transaction có bao quanh lệnh gọi ra ngoài không? (HTTP, queue, file)
+- [ ] Ghi hàng loạt có dùng `COPY` hoặc multi-row `INSERT` không?
+- [ ] Có xử lý retry cho `40001` và `40P01` không? Có backoff và jitter không?
+- [ ] Pagination dùng keyset hay `OFFSET`?
+- [ ] Cập nhật counter có dùng `SET x = x + n` thay vì đọc-rồi-ghi không? (Phần 03)
+- [ ] `UPDATE` hàng loạt có `WHERE ... IS DISTINCT FROM` để tránh dead tuple thừa không?
+- [ ] Migration đã được đọc bằng mắt chưa? Có `lock_timeout` không?
+- [ ] Có `SELECT *` trên bảng có column lớn không? (Phần 02)
+- [ ] Timeout đã đặt ở mức role chưa?
+
+---
+
+## 10. Những gì bạn nên rút ra từ phần này
+
+1. N+1 hiện ra dưới dạng `calls` khổng lồ với `mean_exec_time` cực nhỏ — tối ưu query đó vô ích.
+2. **Không bao giờ gọi HTTP bên trong transaction.** Đây là nguyên nhân số một của
+   `idle in transaction`, và kéo theo bloat lẫn pool đầy.
+3. `COPY` là cách ghi hàng loạt nhanh nhất và sinh ít WAL nhất.
+4. Outbox pattern giữ tính nhất quán mà không cần transaction phân tán, nhưng là at-least-once
+   nên bên nhận phải idempotent.
+5. Retry phải có backoff, jitter và giới hạn; chỉ retry `40001` và `40P01`.
+6. `OFFSET` lớn đọc rồi vứt bỏ toàn bộ row phía trước. Keyset pagination có thời gian không đổi.
+7. Luôn đọc SQL mà ORM sinh ra trước khi chạy migration.
+8. Cache không sửa được query thiếu index — nó chỉ hoãn vấn đề lại.
+
+---
+
+**Tiếp theo:** Phần 16 — Case study production.

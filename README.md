@@ -66,9 +66,10 @@ Mỗi module có cấu trúc giống nhau:
 |---|---|
 | `README.md` | Lý thuyết, giải thích theo 3 tầng |
 | `lab.md` | Thực hành trên PostgreSQL thật, có thể copy chạy được |
-| `bai-tap.md` | Bài tập tự làm |
-| `kiem-tra.md` | Câu hỏi kiểm tra, có đáp án và giải thích |
-| `troubleshooting.md` | Triệu chứng → chẩn đoán → xử lý (với các module liên quan production) |
+| `bai-tap.md` | Bài tập tự làm, kèm đáp án |
+| `kiem-tra.md` | Câu hỏi kiểm tra riêng (chỉ với module đủ lớn) |
+
+Từ **Phần 09** trở đi, phần thực hành được lồng ngay vào `README.md` thay vì tách file riêng.
 
 Phần lý thuyết luôn được trình bày theo 3 tầng:
 
@@ -90,24 +91,27 @@ Chi tiết đầy đủ nằm ở [ROADMAP.md](ROADMAP.md). Tóm tắt:
 | Phần | Chủ đề | Trọng tâm |
 |---|---|---|
 | [00](00-moi-truong/README.md) | Môi trường thực hành | Docker, psql, dataset mẫu, extension chẩn đoán |
-| 01 | Kiến trúc tổng quan | Process model, vòng đời một câu SQL |
-| 02 | Storage layer | Page 8KB, tuple header, TOAST, HOT update |
-| 03 | MVCC & Transaction | Snapshot, isolation level, các anomaly |
-| 04 | VACUUM & Autovacuum | Dead tuple, bloat, freeze, xid wraparound |
-| 05 | Index | B-tree internals, GIN, GiST, BRIN, khi nào index vô dụng |
-| 06 | Query Planner & Optimizer | Statistics, cost model, cardinality, join algorithm |
-| 07 | Đọc EXPLAIN chuyên sâu | BUFFERS, ước lượng sai, spill to disk |
-| 08 | Lock & Concurrency | Lock mode, deadlock, lock queue, SKIP LOCKED |
-| 09 | WAL, Checkpoint, Durability | LSN, crash recovery, PITR |
-| 10 | Replication & HA | Streaming, logical, replication lag, failover |
-| 11 | Connection & Resource | PgBouncer, work_mem, temp file |
-| 12 | Partitioning & Scale | Range/list/hash, partition pruning, sharding |
-| 13 | Schema & Data Modeling | Data type, JSONB, migration zero-downtime |
-| 14 | Monitoring & Debug | pg_stat_statements, wait event, playbook sự cố |
-| 15 | Application side | N+1, batch, outbox, retry, ORM pitfall |
-| 16 | Case study production | Các tình huống thật, phân tích từ đầu tới cuối |
+| [01](01-kien-truc-tong-quan/README.md) | Kiến trúc tổng quan | Process model, vòng đời một câu SQL |
+| [02](02-storage-layer/README.md) | Storage layer | Page 8KB, tuple header, TOAST, HOT update |
+| [03](03-mvcc-transaction/README.md) | MVCC & Transaction | Snapshot, isolation level, các anomaly |
+| [04](04-vacuum-autovacuum/README.md) | VACUUM & Autovacuum | Dead tuple, bloat, freeze, xid wraparound |
+| [05](05-index/README.md) | Index | B-tree internals, GIN, GiST, BRIN, khi nào index vô dụng |
+| [06](06-query-planner/README.md) | Query Planner & Optimizer | Statistics, cost model, cardinality, join algorithm |
+| [07](07-doc-explain/README.md) | Đọc EXPLAIN chuyên sâu | BUFFERS, ước lượng sai, spill to disk |
+| [08](08-lock-concurrency/README.md) | Lock & Concurrency | Lock mode, deadlock, lock queue, SKIP LOCKED |
+| [09](09-wal-checkpoint/README.md) | WAL, Checkpoint, Durability | LSN, crash recovery, PITR |
+| [10](10-replication/README.md) | Replication & HA | Streaming, logical, replication lag, failover |
+| [11](11-connection-resource/README.md) | Connection & Resource | PgBouncer, work_mem, temp file |
+| [12](12-partitioning/README.md) | Partitioning & Scale | Range/list/hash, partition pruning, sharding |
+| [13](13-schema-modeling/README.md) | Schema & Data Modeling | Data type, JSONB, migration zero-downtime |
+| [14](14-monitoring-debug/README.md) | Monitoring & Debug | pg_stat_statements, wait event, playbook sự cố |
+| [15](15-phia-application/README.md) | Phía application | N+1, batch, outbox, retry, ORM pitfall |
+| [16](16-case-study/README.md) | Case study production | Các tình huống thật, phân tích từ đầu tới cuối |
 
-Phụ lục: bảng tra cứu parameter, checklist review query, checklist review migration.
+**Phụ lục:** [tham số](appendix/parameters.md) · [checklist review query](appendix/checklist-review-query.md) ·
+[checklist review migration](appendix/checklist-review-migration.md) ·
+[checklist lên production](appendix/checklist-truoc-khi-len-production.md) ·
+[từ điển thuật ngữ](appendix/thuat-ngu.md) · [tài liệu tham khảo](appendix/tai-lieu-tham-khao.md)
 
 ---
 
